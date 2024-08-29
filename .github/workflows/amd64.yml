@@ -38,6 +38,19 @@ jobs:
         name: docker-images-tar
         path: x86-64-images.tar.gz
         retention-days: 1  # 将保留天数设置为 1 天 最多可设置90天
+        
+    - name: Create Release and Upload Release Asset
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        tag_name: "${{ github.event.inputs.docker_images }}"
+        name: Release "${{ github.event.inputs.docker_images }}"
+        body: TODO New Release.
+        draft: false
+        prerelease: false
+        files: |
+          x86-64-images.tar.gz
+          LICENSE 
 
     - name: Clean up intermediate files
       run: |

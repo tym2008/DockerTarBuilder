@@ -50,6 +50,7 @@ jobs:
         prerelease: false
         files: |
           x86-64-images.tar.gz
+          "${image//\//_}-amd64.tar"
           LICENSE 
 
     - name: Clean up intermediate files

@@ -4,6 +4,8 @@
 
 ## 🤔 这是什么？
 它是一个工作流。可快速构建指定架构/平台的docker镜像
+本仓库修改了x86镜像的拉取环节，拉取后会自动把x86-64-images.tar.gz上传到release，方便分享和下载
+
 
 ## 使用说明
 https://wkdaily.cpolar.cn/archives/gc

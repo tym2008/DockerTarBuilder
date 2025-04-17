@@ -1,0 +1,213 @@
+name: x86-64 Pull, Save, Compress, and Release Docker Images ( Auto Split Compression)
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_images:
+        description: '请填写 Docker 镜像名称，多个用英文逗号分隔 (例如: alpine:latest,nginx:stable)'
+        required: true
+        default: 'alpine:latest' # 设置默认的 Docker 镜像列表
+
+env:
+  # GitHub Actions 会自动提供此 Token，gh CLI 需要它来与仓库交互
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # 设置分卷大小（略小于 2GiB 以保证安全）
+  SPLIT_SIZE: 1990m
+
+jobs:
+  pull_package_release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 需要写入权限来创建 Release 和上传资源
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install 7-Zip
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y p7zip-full
+        echo "7-Zip installed."
+
+    - name: Set up Docker Buildx (optional but good practice)
+      uses: docker/setup-buildx-action@v3
+
+    - name: Clean up Docker to free space
+      run: |
+        echo "Starting Docker cleanup..."
+        docker system prune -a -f || true # Allow failure if nothing to prune
+        docker volume prune -f || true
+        echo "Docker cleanup finished."
+
+    - name: Process Docker Images
+      id: process_images
+      shell: bash # 明确使用 bash
+      run: |
+        set -e # Exit immediately if a command exits with a non-zero status.
+
+        images_input="${{ github.event.inputs.docker_images }}"
+        # 先替换逗号周围的空格，再按逗号分割
+        images_input_cleaned=$(echo "$images_input" | sed 's/ *, */,/g')
+        IFS=',' read -r -a image_array <<< "$images_input_cleaned" # Split input string into an array
+
+        # --- Release Variables ---
+        RELEASE_TAG="docker-images-$(date +'%Y%m%d')-${{ github.run_id }}"
+        RELEASE_TITLE="Docker Images Build - $(date +'%Y-%m-%d %H:%M:%S')"
+        RELEASE_BODY_HEADER="Automated release containing Docker images:\n"
+        # 存储需要上传的文件列表
+        declare -a files_to_upload=()
+        # 存储处理过的镜像信息，用于 Release Body
+        declare -a processed_info=()
+
+        # 将分卷大小 (e.g., 1990m) 转换为字节进行比较
+        size_limit_bytes=$(($(echo "$SPLIT_SIZE" | sed 's/[mM]//i') * 1024 * 1024))
+        echo "Using split volume size: $SPLIT_SIZE (approx $size_limit_bytes bytes)"
+
+        echo "Processing images: ${image_array[@]}"
+        echo "Release Tag: $RELEASE_TAG"
+        echo "Release Title: $RELEASE_TITLE"
+
+        # --- Create Release Draft (or final release) ---
+        echo "Creating GitHub Release..."
+        gh release create "$RELEASE_TAG" \
+           --title "$RELEASE_TITLE" \
+           --notes "Processing..." \
+           --draft=false \
+           --prerelease=false
+        echo "Release created."
+
+        # --- Process Each Image ---
+        for image in "${image_array[@]}"; do
+          # 去除可能存在的前后空格 (虽然上面已处理，双重保险)
+          image=$(echo "$image" | xargs)
+          if [[ -z "$image" ]]; then
+            echo "Skipping empty image entry."
+            continue
+          fi
+
+          echo "--- Processing image: $image ---"
+          image_file_base="${image//\//_}" # Replace slashes with underscores for filename
+          image_file_base="${image_file_base//:/_}" # Replace colons with underscores
+          image_file_tar="${image_file_base}-amd64.tar"
+          image_file_gz="${image_file_tar}.gz"
+          image_7z_base="${image_file_base}-amd64.tar.gz" # Base name for 7z archive parts
+
+          # 清理可能存在的旧文件
+          rm -f "${image_file_tar}" "${image_file_gz}" "${image_7z_base}.7z."*
+
+          local_files_this_image=() # Files generated for *this* image
+
+          # 1. Pull Image
+          echo "Pulling $image (platform linux/amd64)..."
+          if ! docker pull "${image}" --platform "linux/amd64"; then
+             echo "ERROR: Failed to pull image '$image'. Skipping this image."
+             processed_info+=("*   \`$image\` - **Failed to pull**")
+             continue # Skip to the next image
+          fi
+
+          # 2. Save Image
+          echo "Saving $image to $image_file_tar..."
+          if ! docker save "${image}" -o "$image_file_tar"; then
+             echo "ERROR: Failed to save image '$image' to TAR. Skipping this image."
+             processed_info+=("*   \`$image\` - **Failed to save**")
+             rm -f "${image_file_tar}" # Clean up potentially incomplete tar
+             continue
+          fi
+
+          # 3. Compress Image using gzip (standard .tar.gz)
+          echo "Compressing $image_file_tar to $image_file_gz..."
+          if ! gzip "$image_file_tar"; then
+            echo "ERROR: Failed to gzip '$image_file_tar'. Skipping this image."
+            processed_info+=("*   \`$image\` - **Failed to compress (gzip)**")
+            rm -f "$image_file_tar" # gzip might leave the original if it fails
+            continue
+          fi
+          # Now only image_file_gz exists
+
+          # 4. Check Size and Use 7z for Splitting if Necessary
+          echo "Checking size of $image_file_gz..."
+          if [[ ! -f "$image_file_gz" ]]; then
+             echo "ERROR: Compressed file '$image_file_gz' not found after gzip. Skipping this image."
+             processed_info+=("*   \`$image\` - **Compression artifact missing**")
+             continue
+          fi
+          gz_size=$(stat -c%s "$image_file_gz")
+          echo "Size of $image_file_gz is $gz_size bytes."
+
+          if [[ "$gz_size" -gt "$size_limit_bytes" ]]; then
+            # Size exceeds limit, use 7z to create compressed split volumes
+            echo "$image_file_gz is larger than $SPLIT_SIZE. Creating split 7z archive..."
+            # Command: 7z a <archive_name_base>.7z -v<size> <file_to_compress>
+            # Example Output: imagename.tar.gz.7z.001, imagename.tar.gz.7z.002, ...
+            if 7z a "${image_7z_base}.7z" -v"$SPLIT_SIZE" "$image_file_gz"; then
+              echo "Split 7z archive created."
+              # Add split parts to the upload list
+              # Use find to handle potential globbing issues or large number of files
+              while IFS= read -r -d $'\0' file; do
+                local_files_this_image+=("$file")
+              done < <(find . -maxdepth 1 -name "${image_7z_base}.7z.*" -print0)
+
+              # Clean up the large original .gz file as it's now archived in .7z parts
+              rm "$image_file_gz"
+              processed_info+=("*   \`$image\` - Size: $(printf "%.2f GiB" $(bc <<< "scale=2; $gz_size/1024/1024/1024")) (split into .7z volumes)")
+            else
+              echo "ERROR: Failed to create split 7z archive for '$image_file_gz'. Keeping the original .tar.gz file."
+              # Keep the original large file if 7z fails
+              local_files_this_image+=("$image_file_gz")
+              processed_info+=("*   \`$image\` - Size: $(printf "%.2f GiB" $(bc <<< "scale=2; $gz_size/1024/1024/1024")) (**7z splitting failed**, uploaded original large .tar.gz)")
+            fi
+          else
+            # Size is within limit, use the single .gz file
+            echo "$image_file_gz is within the size limit. Adding to upload list."
+            local_files_this_image+=("$image_file_gz")
+            processed_info+=("*   \`$image\` - Size: $(printf "%.2f MiB" $(bc <<< "scale=2; $gz_size/1024/1024")) (.tar.gz)")
+          fi
+
+          # Add files generated for this image to the main upload list
+          files_to_upload+=("${local_files_this_image[@]}")
+
+          echo "--- Finished processing $image ---"
+          echo "" # Add a newline for readability
+        done
+
+        # --- Finalize Release Body ---
+        FINAL_RELEASE_BODY="${RELEASE_BODY_HEADER}\nImages processed:\n"
+        for info in "${processed_info[@]}"; do
+          FINAL_RELEASE_BODY+="$info\n"
+        done
+        FINAL_RELEASE_BODY+="\n\nNote: Images resulting in archives larger than ${SPLIT_SIZE} have been split into multiple '.7z.XXX' volumes using 7-Zip. Use 7-Zip or a compatible tool to extract the first volume ('.7z.001') to decompress the original '.tar.gz' file."
+
+        echo "Updating release notes..."
+        # Use process substitution to pass multi-line body safely
+        gh release edit "$RELEASE_TAG" --notes-file <(echo -e "$FINAL_RELEASE_BODY")
+
+        # --- Upload Files ---
+        if [[ ${#files_to_upload[@]} -gt 0 ]]; then
+          echo "Uploading the following files to release $RELEASE_TAG:"
+          printf '  %s\n' "${files_to_upload[@]}" # Print each file on a new line indented
+          # Use gh release upload, --clobber overwrites if files with same name exist in the release
+          if gh release upload "$RELEASE_TAG" "${files_to_upload[@]}" --clobber; then
+            echo "Upload complete."
+            # --- Clean up uploaded files ---
+            echo "Cleaning up local copies of uploaded files..."
+            rm -f "${files_to_upload[@]}"
+            echo "Local file cleanup complete."
+          else
+            echo "ERROR: Failed to upload assets to the release. Local files were NOT deleted."
+            # Optionally add logic here, e.g., fail the workflow: exit 1
+          fi
+        else
+          echo "No files generated or processed successfully to upload."
+          # If no files were generated, maybe delete the empty release?
+          echo "Deleting empty release $RELEASE_TAG"
+          gh release delete "$RELEASE_TAG" --yes
+        fi
+
+    - name: Final Docker Cleanup (optional)
+      if: always() # Run even if previous steps fail
+      run: |
+        echo "Starting final Docker cleanup..."
+        docker system prune -a -f || true
+        docker volume prune -f || true
+        echo "Final Docker cleanup finished."
